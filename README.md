@@ -49,6 +49,11 @@ passphrase as usual.
 If you have multiple tokens you can enroll all of them, and
 `fido2luks` will detect which one to use at boot time.
 
+If the token is connected but not detected during boot make sure that
+the initramfs contains the necessary drivers. Check your
+`initramfs.conf` and set `MODULES=most` or add the necessary modules
+manually.
+
 ## How this works
 
 If you are not interested in the technical details you can skip this
