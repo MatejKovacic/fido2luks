@@ -6,6 +6,8 @@ This is an initramfs-tools extension to unlock LUKS-encrypted volumes at boot ti
 
 Updated script has support for Plymouth bootsplash, has multilingual support (curently English and SLovenian language) and can supress technical/debug messages and shown only user-friendly output.
 
+<img width="556" height="353" alt="image" src="https://github.com/user-attachments/assets/b855777d-b227-4e5e-9243-1d59697faba0" />
+
 Script was tested with Yubikey 5 NFC and Nitrokey 3A Mini on Debian 13.4, however it should support any FIDO2 key.
 
 To disable technical/debug messages (and show only messages suitable for non-tecnical users) change:
