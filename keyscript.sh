@@ -14,7 +14,7 @@ trap cleanup INT EXIT
 # Default is 0 so normal users see only human-readable recovery messages.
 FIDO2LUKS_DEBUG=${FIDO2LUKS_DEBUG:-1}
 
-# Language for user-facing messages: en, sl, de.
+# Language for user-facing messages: en, sl.
 # Default is English unless explicitly changed in this script or environment.
 FIDO2LUKS_LANG=${FIDO2LUKS_LANG:-en}
 
