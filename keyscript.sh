@@ -10,22 +10,20 @@ LUKS_TOKEN_LIST=$(mktemp -t tokenlist.XXXXXX)
 LUKS_TOKEN=$(mktemp -t token.XXXXXX)
 trap cleanup INT EXIT
 
-# Enable or disable technical/debug messages shown via Plymouth (and in text mode).
-# Default is 0 so normal users see only human-readable recovery messages.
+# Enable technical/debug messages shown via Plymouth and text console.
+# Set to 1 while testing. After everything works reliably, you can set this back to 0.
 FIDO2LUKS_DEBUG=${FIDO2LUKS_DEBUG:-1}
 
 # Language for user-facing messages: en, sl.
-# Default is English unless explicitly changed in this script or environment.
 FIDO2LUKS_LANG=${FIDO2LUKS_LANG:-en}
 
-# Return success only when the Plymouth client exists and
-# the Plymouth daemon is currently running in the initramfs.
+# How long to wait for the FIDO2 USB key to appear during initramfs boot.
+FIDO2LUKS_WAIT_SECONDS=${FIDO2LUKS_WAIT_SECONDS:-20}
+
 plymouth_available () {
     command -v plymouth >/dev/null 2>&1 && plymouth --ping >/dev/null 2>&1
 }
 
-# Translate user-facing messages. Keep technical/debug strings outside this
-# function so they remain useful for troubleshooting and upstream reports.
 msg_text () {
     _msg_id=$1
     _arg1=${2:-}
@@ -67,8 +65,8 @@ Dotaknite se varnostnega USB ključa ZDAJ.
 
 Prehod na obnovitveno šifrirno geslo čez ${_arg1}s.
 EOF
-
             ;;
+
         *:touch_countdown)
             cat <<EOF
 Please confirm your presence.
@@ -136,8 +134,6 @@ EOF
     esac
 }
 
-# Print a status message to the text console as before, and
-# also mirror it to Plymouth when Plymouth is available.
 plymouth_message () {
     echo "*** $*" >&2
     if plymouth_available; then
@@ -145,17 +141,12 @@ plymouth_message () {
     fi
 }
 
-# Print technical/debug messages only when FIDO2LUKS_DEBUG=1.
-# Human-readable recovery messages should use plymouth_message directly.
 debug_message () {
     if [ "$FIDO2LUKS_DEBUG" = "1" ]; then
-        plymouth_message "$@"
+        plymouth_message "DEBUG: $*"
     fi
 }
 
-# Show an explicit hint for the required physical touch step.
-# This is especially useful with graphical Plymouth themes,
-# because the FIDO2 authenticator itself gives no text prompt.
 plymouth_touch_hint () {
     if [ "$REQ_UP" = "true" ]; then
         plymouth_message "$(msg_text touch_hint)"
@@ -163,27 +154,53 @@ plymouth_touch_hint () {
 }
 
 try_fido2_unlock () {
-    # Get all tokens from the LUKS header with FIDO2 credentials.
-    # Sort the array, placing entries with "fido2-uv-required: true" at the end.
+    debug_message "Starting FIDO2 LUKS unlock"
+    debug_message "CRYPTTAB_SOURCE=$CRYPTTAB_SOURCE"
+    debug_message "PATH=$PATH"
+    debug_message "cryptsetup path=$(command -v cryptsetup || echo missing)"
+    debug_message "jq path=$(command -v jq || echo missing)"
+    debug_message "fido2-token path=$(command -v fido2-token || echo missing)"
+    debug_message "fido2-assert path=$(command -v fido2-assert || echo missing)"
+
+    if [ -z "$CRYPTTAB_SOURCE" ]; then
+        debug_message "CRYPTTAB_SOURCE is empty"
+        return 1
+    fi
+
+    # Read FIDO2 tokens from the LUKS2 header.
+    # Important: ignore orphaned tokens with empty keyslots.
     if ! cryptsetup luksDump --dump-json-metadata "$CRYPTTAB_SOURCE" | \
-            jq -e '[.tokens[] | select(."fido2-credential" != null)] | sort_by(."fido2-uv-required")' > "$LUKS_TOKEN_LIST"; then
-        debug_message "Error reading LUKS header in $CRYPTTAB_SOURCE"
+            jq -e '[.tokens[]
+                    | select(."fido2-credential" != null)
+                    | select((.keyslots // []) | length > 0)]
+                   | sort_by(."fido2-uv-required")' > "$LUKS_TOKEN_LIST"; then
+        debug_message "Error reading usable FIDO2 tokens from LUKS header: $CRYPTTAB_SOURCE"
         return 1
     fi
 
-    # Count how many tokens we have.
     NTOKENS=$(jq length "$LUKS_TOKEN_LIST")
+    debug_message "Found $NTOKENS usable FIDO2 LUKS token(s)"
+
     if [ -z "$NTOKENS" ] || [ "$NTOKENS" = "0" ]; then
-        debug_message "No FIDO2 credentials found in $CRYPTTAB_SOURCE"
+        debug_message "No usable FIDO2 credentials found in $CRYPTTAB_SOURCE"
         return 1
     fi
 
-    # Check if the FIDO2 authenticator is inserted
+    # Wait for FIDO2 authenticator.
     plymouth_message "$(msg_text waiting_key)"
-    for _f in $(seq 5); do
-        FIDO2_AUTHENTICATOR=$(fido2-token -L)
+
+    FIDO2_AUTHENTICATOR=""
+    _i=0
+    while [ "$_i" -lt "$FIDO2LUKS_WAIT_SECONDS" ]; do
+        FIDO2_AUTHENTICATOR=$(fido2-token -L 2>/dev/null)
+        debug_message "fido2-token -L attempt $_i returned: $FIDO2_AUTHENTICATOR"
+
+        if [ -n "$FIDO2_AUTHENTICATOR" ]; then
+            break
+        fi
+
+        _i=$((_i + 1))
         sleep 1
-        [ -n "$FIDO2_AUTHENTICATOR" ] && break
     done
 
     if [ -z "$FIDO2_AUTHENTICATOR" ]; then
@@ -191,91 +208,51 @@ try_fido2_unlock () {
         return 1
     fi
 
-    debug_message "Found FIDO2 authenticator $FIDO2_AUTHENTICATOR"
     FIDO2_DEV=${FIDO2_AUTHENTICATOR%%:*}
+    debug_message "Using FIDO2 authenticator: $FIDO2_AUTHENTICATOR"
+    debug_message "Using FIDO2 device: $FIDO2_DEV"
 
-    # Look for a credential that is valid for the inserted FIDO2
-    # authenticator. For that we try to get an assertion from the
-    # device, with 'up' and 'pin' set to false, so it requires no user
-    # interaction.
-    for i in $(seq "$NTOKENS"); do
-        jq ".[$i-1]" "$LUKS_TOKEN_LIST" > "$LUKS_TOKEN"
-        jq -r '"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-               ."fido2-rp",
-               ."fido2-credential",
-               ."fido2-salt"' "$LUKS_TOKEN" > "$ASSERT_PARAMS"
-        REQ_UV=$(jq -r '."fido2-uv-required"' "$LUKS_TOKEN")
-        # If a credential has the 'uv' option set then unfortunately
-        # we cannot check if it's valid for the inserted FIDO2
-        # authenticator without requiring user interaction.
-        # So this is what we do:
-        # - The array of credentials is sorted, those that require UV
-        #   are at the end.
-        # - All credentials that don't require UV are tested first,
-        #   we can do that silently with the fido2-assert call.
-        # - Once we find a credential that requires UV we assume
-        #   that we can use it with the inserted authenticator.
-        # - Not all authenticators support 'uv' so pass '-t uv' only
-        #   when needed using the UV_OPT variable.
-        if [ "$REQ_UV" = "true" ]; then
-            UV_OPT="-t uv=true"
-            break
-        else
-            UV_OPT=""
-            if fido2-assert -G -t up=false -t pin=false -i "$ASSERT_PARAMS" \
-                            -o /dev/null "$FIDO2_DEV" 2> /dev/null; then
-                break
-            fi
-        fi
-        rm -f "$LUKS_TOKEN" "$ASSERT_PARAMS"
-    done
+    # Use the first usable token.
+    # This avoids the old silent pre-check path which could interact badly
+    # with PIN-required credentials.
+    jq ".[0]" "$LUKS_TOKEN_LIST" > "$LUKS_TOKEN"
 
-    if [ ! -f "$LUKS_TOKEN" ] || [ ! -f "$ASSERT_PARAMS" ]; then
-        debug_message "No valid credential found for this FIDO2 authenticator"
-        return 1
-    fi
+    jq -r '"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+           ."fido2-rp",
+           ."fido2-credential",
+           ."fido2-salt"' "$LUKS_TOKEN" > "$ASSERT_PARAMS"
 
-    # Now that we have a valid credential use it to compute the
-    # hmac-secret, which is what unlocks the LUKS volume.
+    REQ_UV=$(jq -r '."fido2-uv-required"' "$LUKS_TOKEN")
     REQ_PIN=$(jq -r '."fido2-clientPin-required"' "$LUKS_TOKEN")
     REQ_UP=$(jq -r '."fido2-up-required"' "$LUKS_TOKEN")
 
+    if [ "$REQ_UV" = "true" ]; then
+        UV_OPT="-t uv=true"
+    else
+        UV_OPT=""
+    fi
+
+    debug_message "Selected FIDO2 token: pin=$REQ_PIN up=$REQ_UP uv=$REQ_UV dev=$FIDO2_DEV"
+
     if [ "$REQ_PIN" = "true" ] && plymouth_available; then
-        # When Plymouth is active, collect the FIDO2 PIN through
-        # Plymouth's normal password dialog. This gives the user
-        # a proper graphical input field instead of a hidden tty
-        # prompt from fido2-assert.
         PIN=$(plymouth ask-for-password --prompt="$(msg_text pin_prompt)")
 
-        # Capture fido2-assert output and errors separately so
-        # Plymouth can show a live touch countdown and useful
-        # error messages before falling back to the passphrase.
         FIDO2_OUT=$(mktemp -t fido2out.XXXXXX)
         FIDO2_ERR=$(mktemp -t fido2err.XXXXXX)
         FIDO2_ERR_FILTERED=$(mktemp -t fido2err-filtered.XXXXXX)
         FIDO2_PIN=$(mktemp -t fido2pin.XXXXXX)
+
         chmod 600 "$FIDO2_PIN" 2>/dev/null || true
         printf "%s\n" "$PIN" > "$FIDO2_PIN"
-
-        # Clear the shell variable after writing the one-shot PIN
-        # to the initramfs tmpfs file used as fido2-assert stdin.
-        # This is not perfect memory erasure, but avoids keeping
-        # the PIN around longer than necessary in the shell.
         PIN=""
 
-        # fido2-assert uses /dev/tty for PIN entry when a tty is
-        # available. Run it in a new session and feed stdin from
-        # the PIN file. Do not use "setsid -w" because busybox
-        # setsid in initramfs may not support it.
         setsid fido2-assert \
             -G -h -t up="$REQ_UP" -t pin="$REQ_PIN" $UV_OPT \
             -i "$ASSERT_PARAMS" "$FIDO2_DEV" \
             < "$FIDO2_PIN" > "$FIDO2_OUT" 2> "$FIDO2_ERR" &
+
         FIDO2_PID=$!
 
-        # While fido2-assert waits for user presence, keep the
-        # Plymouth screen informative. If the key is not touched
-        # in time, fall back to the regular disk passphrase.
         if [ "$REQ_UP" = "true" ]; then
             for _seconds in 15 14 13 12 11 10 9 8 7 6 5 4 3 2 1; do
                 if ! kill -0 "$FIDO2_PID" 2>/dev/null; then
@@ -287,8 +264,6 @@ try_fido2_unlock () {
         fi
 
         if kill -0 "$FIDO2_PID" 2>/dev/null; then
-            # The touch prompt timed out. Stop fido2-assert so the
-            # boot can proceed to the backup passphrase prompt.
             kill "$FIDO2_PID" 2>/dev/null || true
             wait "$FIDO2_PID" 2>/dev/null || true
             plymouth_message "$(msg_text touch_timeout)"
@@ -299,9 +274,6 @@ try_fido2_unlock () {
             SECRET=$(tail -n 1 "$FIDO2_OUT")
         fi
 
-        # fido2-assert still prints its own "Enter PIN for ..."
-        # prompt even when the PIN is supplied on stdin. Filter
-        # that duplicate prompt, but keep real errors visible.
         if [ -z "$SECRET" ] && [ -s "$FIDO2_ERR" ]; then
             grep -v "^Enter PIN for " "$FIDO2_ERR" > "$FIDO2_ERR_FILTERED" || true
             if [ -s "$FIDO2_ERR_FILTERED" ]; then
@@ -311,33 +283,27 @@ try_fido2_unlock () {
         fi
 
         rm -f "$FIDO2_OUT" "$FIDO2_ERR" "$FIDO2_ERR_FILTERED" "$FIDO2_PIN"
+
     else
         if [ "$REQ_PIN" = "true" ]; then
-            # Without Plymouth, keep the original console behavior
-            # but make the expected touch step explicit.
             plymouth_message "$(msg_text console_pin_touch)"
-            stty -echo
+            stty -echo 2>/dev/null || true
         elif [ "$REQ_UP" = "true" ]; then
-            # If no PIN is required, the user may still need to touch
-            # the authenticator. Make that visible in Plymouth.
             plymouth_touch_hint
         fi
 
-        SECRET=$(fido2-assert -G -h -t up="$REQ_UP" -t pin="$REQ_PIN" $UV_OPT \
-                              -i "$ASSERT_PARAMS" "$FIDO2_DEV" | tail -n 1)
+        SECRET=$(fido2-assert \
+                    -G -h -t up="$REQ_UP" -t pin="$REQ_PIN" $UV_OPT \
+                    -i "$ASSERT_PARAMS" "$FIDO2_DEV" | tail -n 1)
 
         if [ "$REQ_PIN" = "true" ]; then
-            stty echo
+            stty echo 2>/dev/null || true
+            echo >&2
         fi
     fi
 
     if [ -z "$SECRET" ]; then
-        # Show one combined recovery message so Plymouth themes
-        # do not immediately overwrite earlier lines.
         plymouth_message "$(msg_text fido_failed)"
-
-        # Give the user time to read the recovery instruction
-        # before falling back to the regular passphrase prompt.
         sleep 5
         return 1
     fi
@@ -347,7 +313,6 @@ try_fido2_unlock () {
     return 0
 }
 
-# Main execution
 if try_fido2_unlock; then
     exit 0
 fi
